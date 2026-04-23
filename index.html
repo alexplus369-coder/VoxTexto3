@@ -5,8 +5,7 @@ import {
   Cpu, ShieldCheck, Info
 } from 'lucide-react';
 
-// Importamos dinámicamente Transformers.js para el procesamiento local
-// Nota: En un entorno de producción, esto se instalaría vía npm
+// Importación de Transformers.js desde CDN
 import { pipeline } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
 
 const App = () => {
@@ -14,7 +13,7 @@ const App = () => {
   const [videoUrl, setVideoUrl] = useState(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
-  const [progressStatus, setProgressStatus] = useState("");
+  const [progressStatus, setProgressStatus] = useState("Iniciando...");
   const [transcript, setTranscript] = useState([]);
   const [status, setStatus] = useState('idle'); 
   const [errorMsg, setErrorMsg] = useState("");
@@ -28,108 +27,133 @@ const App = () => {
     const initModel = async () => {
       try {
         setProgressStatus("Cargando motor de IA (Whisper)...");
+        // Intentar usar WebGPU para mayor velocidad
         transcriberRef.current = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny', {
-          device: 'webgpu', // Intenta usar aceleración por GPU si está disponible
+          device: 'webgpu',
         });
         setProgressStatus("Motor listo para transcribir.");
       } catch (err) {
-        console.error("Error cargando el modelo:", err);
-        // Fallback a CPU si WebGPU falla
-        transcriberRef.current = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny');
-        setProgressStatus("Motor listo (Modo compatibilidad).");
+        console.warn("WebGPU no disponible, usando CPU:", err);
+        try {
+          transcriberRef.current = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny');
+          setProgressStatus("Motor listo (Modo compatibilidad).");
+        } catch (finalErr) {
+          setErrorMsg("Error crítico al cargar el modelo de IA.");
+          setStatus('error');
+        }
       }
     };
     initModel();
+
+    // Limpieza al desmontar
+    return () => {
+      if (videoUrl) URL.revokeObjectURL(videoUrl);
+    };
   }, []);
 
   const handleFileUpload = (event) => {
-    const file = event.target.files[0];
+    const file = event.target.files?.[0];
     if (file && file.type.startsWith('video/')) {
+      // Limpiar URL anterior si existe
+      if (videoUrl) URL.revokeObjectURL(videoUrl);
+      
+      const url = URL.createObjectURL(file);
       setVideoFile(file);
-      setVideoUrl(URL.createObjectURL(file));
+      setVideoUrl(url);
       setTranscript([]);
       setStatus('idle');
+      setErrorMsg("");
+    } else if (file) {
+      setErrorMsg("Formato no compatible. Por favor sube un video.");
+      setStatus('error');
     }
   };
 
   const removeVideo = () => {
+    if (videoUrl) URL.revokeObjectURL(videoUrl);
     setVideoFile(null);
     setVideoUrl(null);
     setTranscript([]);
     setStatus('idle');
   };
 
-  // Función para extraer audio y transcribir usando Transformers.js
+  const formatTimestamp = (seconds) => {
+    if (seconds == null || isNaN(seconds)) return "00:00:00";
+    const date = new Date(0);
+    date.setSeconds(seconds);
+    return date.toISOString().substring(11, 19);
+  };
+
   const runRealTranscription = async () => {
-    if (!videoFile || !transcriberRef.current) return;
+    if (!videoFile || !transcriberRef.current || !videoUrl) return;
 
     setIsProcessing(true);
     setStatus('loading');
-    setProgress(10);
-    setProgressStatus("Extrayendo audio del video...");
+    setProgress(5);
+    setProgressStatus("Preparando audio...");
 
     try {
-      // 1. Extraer audio usando la API nativa de AudioContext
+      // 1. Extraer audio usando AudioContext
       const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
       const response = await fetch(videoUrl);
+      if (!response.ok) throw new Error("No se pudo acceder al archivo de video.");
+      
       const arrayBuffer = await response.arrayBuffer();
       const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
       
-      // Convertir a mono Float32Array (requerido por Whisper)
+      // Convertir a mono Float32Array (Whisper requiere 16kHz mono)
       const float32Array = audioBuffer.getChannelData(0);
       
-      setProgress(40);
-      setProgressStatus("Procesando voz con IA (esto ocurre en tu PC)...");
+      setProgress(30);
+      setProgressStatus("Transcribiendo con IA...");
 
-      // 2. Ejecutar la transcripción con Whisper
+      // 2. Ejecutar transcripción
       const result = await transcriberRef.current(float32Array, {
         chunk_length_s: 30,
         stride_length_s: 5,
         return_timestamps: true,
-        language: 'spanish', // Forzamos español o podemos dejarlo en 'auto'
+        language: 'spanish',
         callback_function: (data) => {
-          // Actualizar progreso si el modelo lo soporta
-          if (data.status === 'progress') setProgress(40 + (data.progress * 0.5));
+          if (data.status === 'progress') {
+            setProgress(30 + (data.progress * 0.6));
+          }
         }
       });
 
-      // 3. Formatear resultados
+      // 3. Formatear segmentos
       const formattedSegments = result.chunks.map(chunk => ({
         startTime: formatTimestamp(chunk.timestamp[0]),
-        endTime: formatTimestamp(chunk.timestamp[1] || chunk.timestamp[0] + 2),
+        endTime: formatTimestamp(chunk.timestamp[1] || (chunk.timestamp[0] + 2)),
         text: chunk.text
       }));
 
       setTranscript(formattedSegments);
       setStatus('completed');
       setProgress(100);
+      setProgressStatus("Transcripción finalizada.");
     } catch (err) {
-      console.error(err);
-      setErrorMsg("Error procesando: Asegúrate de que el video tenga audio válido.");
+      console.error("Error en transcripción:", err);
+      setErrorMsg("Error al procesar el audio. Asegúrate de que el video tenga sonido.");
       setStatus('error');
     } finally {
       setIsProcessing(false);
     }
   };
 
-  const formatTimestamp = (seconds) => {
-    if (seconds == null) return "00:00:00";
-    const date = new Date(0);
-    date.setSeconds(seconds);
-    return date.toISOString().substr(11, 8);
-  };
-
   const downloadSRT = () => {
-    let srt = transcript.map((item, i) => 
-      `${i + 1}\n${item.startTime.replace('.', ',')} --> ${item.endTime.replace('.', ',')}\n${item.text.trim()}\n`
-    ).join('\n');
+    if (transcript.length === 0) return;
     
-    const blob = new Blob([srt], { type: 'text/plain' });
+    const srtContent = transcript.map((item, i) => (
+      `${i + 1}\n${item.startTime.replace('.', ',')} --> ${item.endTime.replace('.', ',')}\n${item.text.trim()}\n`
+    )).join('\n');
+    
+    const blob = new Blob([srtContent], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = "subtitulos.srt";
+    a.download = `${videoFile?.name?.split('.')[0] || 'subtitulos'}.srt`;
     a.click();
+    URL.revokeObjectURL(url);
   };
 
   return (
@@ -138,17 +162,17 @@ const App = () => {
         {/* Header */}
         <header className="flex flex-col md:flex-row md:items-center justify-between mb-8 gap-4 border-b border-slate-800 pb-6">
           <div>
-            <h1 className="text-3xl font-black tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-indigo-400 via-purple-400 to-pink-400">
-              OPEN SCRIBE LOCAL
+            <h1 className="text-3xl font-black tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-indigo-400 via-purple-400 to-pink-400 uppercase">
+              Open Scribe Local
             </h1>
             <div className="flex items-center gap-2 text-slate-400 mt-2 text-sm">
               <ShieldCheck className="w-4 h-4 text-emerald-500" />
-              <span>Privacidad Total: Tus videos nunca salen de tu ordenador.</span>
+              <span>Privacidad Total: El procesamiento es 100% local.</span>
             </div>
           </div>
-          <div className="flex items-center gap-4 bg-slate-900/50 p-2 rounded-lg border border-slate-800">
+          <div className="flex items-center gap-4 bg-slate-900/50 p-3 rounded-xl border border-slate-800">
             <Cpu className={`w-5 h-5 ${transcriberRef.current ? 'text-emerald-400' : 'text-amber-400 animate-pulse'}`} />
-            <span className="text-xs font-mono">{progressStatus}</span>
+            <span className="text-xs font-mono text-slate-300">{progressStatus}</span>
           </div>
         </header>
 
@@ -156,7 +180,7 @@ const App = () => {
           <div className="lg:col-span-2 space-y-6">
             {!videoUrl ? (
               <div 
-                onClick={() => fileInputRef.current.click()}
+                onClick={() => fileInputRef.current?.click()}
                 className="group border-2 border-dashed border-slate-800 hover:border-indigo-500/50 bg-slate-900/30 rounded-3xl p-16 flex flex-col items-center justify-center cursor-pointer transition-all hover:bg-slate-900/60"
               >
                 <div className="w-20 h-20 bg-indigo-500/10 rounded-full flex items-center justify-center mb-6 group-hover:scale-110 transition-transform border border-indigo-500/20">
@@ -164,9 +188,15 @@ const App = () => {
                 </div>
                 <h3 className="text-2xl font-bold mb-2">Sube un video</h3>
                 <p className="text-slate-500 text-center max-w-sm">
-                  Procesamiento 100% gratuito usando Whisper Tiny. Los archivos se procesan localmente.
+                  Usa archivos MP4 o WebM. El audio será procesado por el modelo Whisper Tiny.
                 </p>
-                <input type="file" ref={fileInputRef} className="hidden" accept="video/*" onChange={handleFileUpload} />
+                <input 
+                  type="file" 
+                  ref={fileInputRef} 
+                  className="hidden" 
+                  accept="video/*" 
+                  onChange={handleFileUpload} 
+                />
               </div>
             ) : (
               <div className="space-y-4 animate-in fade-in duration-500">
@@ -174,7 +204,7 @@ const App = () => {
                   <video ref={videoRef} src={videoUrl} controls className="w-full h-full object-contain" />
                   <button 
                     onClick={removeVideo}
-                    className="absolute top-4 right-4 p-2 bg-red-500/80 hover:bg-red-500 rounded-full opacity-0 group-hover:opacity-100 transition-opacity"
+                    className="absolute top-4 right-4 p-2 bg-red-500/80 hover:bg-red-500 rounded-full opacity-0 group-hover:opacity-100 transition-opacity z-10"
                   >
                     <Trash2 className="w-4 h-4 text-white" />
                   </button>
@@ -186,8 +216,8 @@ const App = () => {
                       <FileVideo className="w-6 h-6 text-indigo-400" />
                     </div>
                     <div className="min-w-0">
-                      <p className="text-sm font-semibold truncate max-w-[250px]">{videoFile.name}</p>
-                      <p className="text-xs text-slate-500 font-mono">Audio 16kHz Mono Ready</p>
+                      <p className="text-sm font-semibold truncate max-w-[200px]">{videoFile?.name}</p>
+                      <p className="text-xs text-slate-500 font-mono uppercase tracking-tighter">Audio Decoder Ready</p>
                     </div>
                   </div>
                   
@@ -202,7 +232,7 @@ const App = () => {
                       }`}
                     >
                       {isProcessing ? <Loader2 className="w-5 h-5 animate-spin" /> : <Type className="w-5 h-5" />}
-                      {isProcessing ? 'Transcribiendo...' : 'Iniciar Transcripción'}
+                      {isProcessing ? 'Procesando...' : 'Transcribir'}
                     </button>
                   )}
                 </div>
@@ -210,7 +240,7 @@ const App = () => {
                 {isProcessing && (
                   <div className="space-y-2 px-2">
                     <div className="flex justify-between text-xs font-mono text-slate-400">
-                      <span>Progreso del sistema</span>
+                      <span>Progreso de IA</span>
                       <span>{Math.round(progress)}%</span>
                     </div>
                     <div className="h-2 bg-slate-800 rounded-full overflow-hidden">
@@ -223,6 +253,13 @@ const App = () => {
                 )}
               </div>
             )}
+            
+            {status === 'error' && (
+              <div className="p-4 bg-red-500/10 border border-red-500/30 rounded-2xl text-red-400 text-sm flex items-center gap-3">
+                <Info className="w-5 h-5 flex-shrink-0" />
+                {errorMsg}
+              </div>
+            )}
           </div>
 
           {/* Sidebar */}
@@ -230,49 +267,46 @@ const App = () => {
             <div className="bg-slate-900/50 p-6 rounded-3xl border border-slate-800 backdrop-blur-sm">
               <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
                 <Info className="w-5 h-5 text-indigo-400" />
-                ¿Cómo funciona?
+                Guía rápida
               </h3>
               <ul className="space-y-4 text-sm text-slate-400">
                 <li className="flex gap-3">
                   <span className="text-indigo-400 font-bold">1.</span>
-                  <span>Extraemos la pista de audio de tu video en formato digital.</span>
+                  <span>Carga el video (el audio se extrae automáticamente).</span>
                 </li>
                 <li className="flex gap-3">
                   <span className="text-indigo-400 font-bold">2.</span>
-                  <span>Usamos **Whisper (Tiny)** cargado en tu navegador para "escuchar".</span>
+                  <span>Presiona "Transcribir" para iniciar el modelo local.</span>
                 </li>
                 <li className="flex gap-3">
                   <span className="text-indigo-400 font-bold">3.</span>
-                  <span>La IA convierte las ondas de sonido en texto con marcas de tiempo.</span>
+                  <span>Revisa el texto y descarga el archivo .SRT.</span>
                 </li>
               </ul>
             </div>
 
             {status === 'completed' && (
-              <div className="bg-slate-900 p-6 rounded-3xl border border-emerald-500/30 animate-in slide-in-from-bottom-4 duration-500">
+              <div className="bg-slate-900 p-6 rounded-3xl border border-emerald-500/30 animate-in slide-in-from-right-4 duration-500">
                 <div className="flex items-center gap-3 mb-4">
                   <CheckCircle2 className="w-6 h-6 text-emerald-400" />
-                  <h3 className="font-bold">¡Listo!</h3>
+                  <h3 className="font-bold">¡Completado!</h3>
                 </div>
                 <button 
                   onClick={downloadSRT}
                   className="w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 py-3 rounded-xl font-bold transition-colors mb-3"
                 >
                   <Download className="w-5 h-5" />
-                  Descargar Subtítulos (.SRT)
+                  Descargar SRT
                 </button>
-                <div className="text-[10px] text-slate-500 text-center font-mono uppercase tracking-widest">
-                  Formato estándar compatible
-                </div>
               </div>
             )}
 
-            {status === 'completed' && (
-              <div className="max-h-[300px] overflow-y-auto pr-2 custom-scrollbar space-y-3">
+            {transcript.length > 0 && (
+              <div className="max-h-[400px] overflow-y-auto pr-2 custom-scrollbar space-y-3">
                 {transcript.map((item, idx) => (
-                  <div key={idx} className="p-3 bg-slate-800/40 rounded-xl border border-slate-700/50 text-xs">
+                  <div key={idx} className="p-3 bg-slate-800/40 rounded-xl border border-slate-700/50 text-xs hover:border-indigo-500/30 transition-colors">
                     <span className="text-indigo-400 font-mono block mb-1">{item.startTime}</span>
-                    <p className="text-slate-200">{item.text}</p>
+                    <p className="text-slate-200 leading-relaxed">{item.text}</p>
                   </div>
                 ))}
               </div>
