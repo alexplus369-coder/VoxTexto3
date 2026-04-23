@@ -1,0 +1,292 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { 
+  Upload, FileVideo, Type, Download, Settings, 
+  Languages, Loader2, Trash2, Clock, CheckCircle2, 
+  Cpu, ShieldCheck, Info
+} from 'lucide-react';
+
+// Importamos dinámicamente Transformers.js para el procesamiento local
+// Nota: En un entorno de producción, esto se instalaría vía npm
+import { pipeline } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
+
+const App = () => {
+  const [videoFile, setVideoFile] = useState(null);
+  const [videoUrl, setVideoUrl] = useState(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [progressStatus, setProgressStatus] = useState("");
+  const [transcript, setTranscript] = useState([]);
+  const [status, setStatus] = useState('idle'); 
+  const [errorMsg, setErrorMsg] = useState("");
+  
+  const fileInputRef = useRef(null);
+  const videoRef = useRef(null);
+  const transcriberRef = useRef(null);
+
+  // Inicializar el modelo de IA al cargar la app
+  useEffect(() => {
+    const initModel = async () => {
+      try {
+        setProgressStatus("Cargando motor de IA (Whisper)...");
+        transcriberRef.current = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny', {
+          device: 'webgpu', // Intenta usar aceleración por GPU si está disponible
+        });
+        setProgressStatus("Motor listo para transcribir.");
+      } catch (err) {
+        console.error("Error cargando el modelo:", err);
+        // Fallback a CPU si WebGPU falla
+        transcriberRef.current = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny');
+        setProgressStatus("Motor listo (Modo compatibilidad).");
+      }
+    };
+    initModel();
+  }, []);
+
+  const handleFileUpload = (event) => {
+    const file = event.target.files[0];
+    if (file && file.type.startsWith('video/')) {
+      setVideoFile(file);
+      setVideoUrl(URL.createObjectURL(file));
+      setTranscript([]);
+      setStatus('idle');
+    }
+  };
+
+  const removeVideo = () => {
+    setVideoFile(null);
+    setVideoUrl(null);
+    setTranscript([]);
+    setStatus('idle');
+  };
+
+  // Función para extraer audio y transcribir usando Transformers.js
+  const runRealTranscription = async () => {
+    if (!videoFile || !transcriberRef.current) return;
+
+    setIsProcessing(true);
+    setStatus('loading');
+    setProgress(10);
+    setProgressStatus("Extrayendo audio del video...");
+
+    try {
+      // 1. Extraer audio usando la API nativa de AudioContext
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      const response = await fetch(videoUrl);
+      const arrayBuffer = await response.arrayBuffer();
+      const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+      
+      // Convertir a mono Float32Array (requerido por Whisper)
+      const float32Array = audioBuffer.getChannelData(0);
+      
+      setProgress(40);
+      setProgressStatus("Procesando voz con IA (esto ocurre en tu PC)...");
+
+      // 2. Ejecutar la transcripción con Whisper
+      const result = await transcriberRef.current(float32Array, {
+        chunk_length_s: 30,
+        stride_length_s: 5,
+        return_timestamps: true,
+        language: 'spanish', // Forzamos español o podemos dejarlo en 'auto'
+        callback_function: (data) => {
+          // Actualizar progreso si el modelo lo soporta
+          if (data.status === 'progress') setProgress(40 + (data.progress * 0.5));
+        }
+      });
+
+      // 3. Formatear resultados
+      const formattedSegments = result.chunks.map(chunk => ({
+        startTime: formatTimestamp(chunk.timestamp[0]),
+        endTime: formatTimestamp(chunk.timestamp[1] || chunk.timestamp[0] + 2),
+        text: chunk.text
+      }));
+
+      setTranscript(formattedSegments);
+      setStatus('completed');
+      setProgress(100);
+    } catch (err) {
+      console.error(err);
+      setErrorMsg("Error procesando: Asegúrate de que el video tenga audio válido.");
+      setStatus('error');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const formatTimestamp = (seconds) => {
+    if (seconds == null) return "00:00:00";
+    const date = new Date(0);
+    date.setSeconds(seconds);
+    return date.toISOString().substr(11, 8);
+  };
+
+  const downloadSRT = () => {
+    let srt = transcript.map((item, i) => 
+      `${i + 1}\n${item.startTime.replace('.', ',')} --> ${item.endTime.replace('.', ',')}\n${item.text.trim()}\n`
+    ).join('\n');
+    
+    const blob = new Blob([srt], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = "subtitulos.srt";
+    a.click();
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100 p-4 md:p-8 font-sans">
+      <div className="max-w-6xl mx-auto">
+        {/* Header */}
+        <header className="flex flex-col md:flex-row md:items-center justify-between mb-8 gap-4 border-b border-slate-800 pb-6">
+          <div>
+            <h1 className="text-3xl font-black tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-indigo-400 via-purple-400 to-pink-400">
+              OPEN SCRIBE LOCAL
+            </h1>
+            <div className="flex items-center gap-2 text-slate-400 mt-2 text-sm">
+              <ShieldCheck className="w-4 h-4 text-emerald-500" />
+              <span>Privacidad Total: Tus videos nunca salen de tu ordenador.</span>
+            </div>
+          </div>
+          <div className="flex items-center gap-4 bg-slate-900/50 p-2 rounded-lg border border-slate-800">
+            <Cpu className={`w-5 h-5 ${transcriberRef.current ? 'text-emerald-400' : 'text-amber-400 animate-pulse'}`} />
+            <span className="text-xs font-mono">{progressStatus}</span>
+          </div>
+        </header>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+          <div className="lg:col-span-2 space-y-6">
+            {!videoUrl ? (
+              <div 
+                onClick={() => fileInputRef.current.click()}
+                className="group border-2 border-dashed border-slate-800 hover:border-indigo-500/50 bg-slate-900/30 rounded-3xl p-16 flex flex-col items-center justify-center cursor-pointer transition-all hover:bg-slate-900/60"
+              >
+                <div className="w-20 h-20 bg-indigo-500/10 rounded-full flex items-center justify-center mb-6 group-hover:scale-110 transition-transform border border-indigo-500/20">
+                  <Upload className="w-10 h-10 text-indigo-400" />
+                </div>
+                <h3 className="text-2xl font-bold mb-2">Sube un video</h3>
+                <p className="text-slate-500 text-center max-w-sm">
+                  Procesamiento 100% gratuito usando Whisper Tiny. Los archivos se procesan localmente.
+                </p>
+                <input type="file" ref={fileInputRef} className="hidden" accept="video/*" onChange={handleFileUpload} />
+              </div>
+            ) : (
+              <div className="space-y-4 animate-in fade-in duration-500">
+                <div className="relative bg-black rounded-3xl overflow-hidden shadow-2xl aspect-video border border-slate-800 group">
+                  <video ref={videoRef} src={videoUrl} controls className="w-full h-full object-contain" />
+                  <button 
+                    onClick={removeVideo}
+                    className="absolute top-4 right-4 p-2 bg-red-500/80 hover:bg-red-500 rounded-full opacity-0 group-hover:opacity-100 transition-opacity"
+                  >
+                    <Trash2 className="w-4 h-4 text-white" />
+                  </button>
+                </div>
+                
+                <div className="flex flex-col sm:flex-row items-center justify-between p-5 bg-slate-900 rounded-2xl border border-slate-800 gap-4">
+                  <div className="flex items-center gap-4 w-full">
+                    <div className="p-3 bg-indigo-500/10 rounded-xl">
+                      <FileVideo className="w-6 h-6 text-indigo-400" />
+                    </div>
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold truncate max-w-[250px]">{videoFile.name}</p>
+                      <p className="text-xs text-slate-500 font-mono">Audio 16kHz Mono Ready</p>
+                    </div>
+                  </div>
+                  
+                  {status !== 'completed' && (
+                    <button 
+                      onClick={runRealTranscription}
+                      disabled={isProcessing || !transcriberRef.current}
+                      className={`w-full sm:w-auto flex items-center justify-center gap-2 px-8 py-3 rounded-xl font-bold transition-all ${
+                        isProcessing 
+                        ? 'bg-slate-800 text-slate-500 cursor-wait' 
+                        : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-500/20 active:scale-95'
+                      }`}
+                    >
+                      {isProcessing ? <Loader2 className="w-5 h-5 animate-spin" /> : <Type className="w-5 h-5" />}
+                      {isProcessing ? 'Transcribiendo...' : 'Iniciar Transcripción'}
+                    </button>
+                  )}
+                </div>
+
+                {isProcessing && (
+                  <div className="space-y-2 px-2">
+                    <div className="flex justify-between text-xs font-mono text-slate-400">
+                      <span>Progreso del sistema</span>
+                      <span>{Math.round(progress)}%</span>
+                    </div>
+                    <div className="h-2 bg-slate-800 rounded-full overflow-hidden">
+                      <div 
+                        className="h-full bg-indigo-500 transition-all duration-300" 
+                        style={{ width: `${progress}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Sidebar */}
+          <div className="space-y-6">
+            <div className="bg-slate-900/50 p-6 rounded-3xl border border-slate-800 backdrop-blur-sm">
+              <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
+                <Info className="w-5 h-5 text-indigo-400" />
+                ¿Cómo funciona?
+              </h3>
+              <ul className="space-y-4 text-sm text-slate-400">
+                <li className="flex gap-3">
+                  <span className="text-indigo-400 font-bold">1.</span>
+                  <span>Extraemos la pista de audio de tu video en formato digital.</span>
+                </li>
+                <li className="flex gap-3">
+                  <span className="text-indigo-400 font-bold">2.</span>
+                  <span>Usamos **Whisper (Tiny)** cargado en tu navegador para "escuchar".</span>
+                </li>
+                <li className="flex gap-3">
+                  <span className="text-indigo-400 font-bold">3.</span>
+                  <span>La IA convierte las ondas de sonido en texto con marcas de tiempo.</span>
+                </li>
+              </ul>
+            </div>
+
+            {status === 'completed' && (
+              <div className="bg-slate-900 p-6 rounded-3xl border border-emerald-500/30 animate-in slide-in-from-bottom-4 duration-500">
+                <div className="flex items-center gap-3 mb-4">
+                  <CheckCircle2 className="w-6 h-6 text-emerald-400" />
+                  <h3 className="font-bold">¡Listo!</h3>
+                </div>
+                <button 
+                  onClick={downloadSRT}
+                  className="w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 py-3 rounded-xl font-bold transition-colors mb-3"
+                >
+                  <Download className="w-5 h-5" />
+                  Descargar Subtítulos (.SRT)
+                </button>
+                <div className="text-[10px] text-slate-500 text-center font-mono uppercase tracking-widest">
+                  Formato estándar compatible
+                </div>
+              </div>
+            )}
+
+            {status === 'completed' && (
+              <div className="max-h-[300px] overflow-y-auto pr-2 custom-scrollbar space-y-3">
+                {transcript.map((item, idx) => (
+                  <div key={idx} className="p-3 bg-slate-800/40 rounded-xl border border-slate-700/50 text-xs">
+                    <span className="text-indigo-400 font-mono block mb-1">{item.startTime}</span>
+                    <p className="text-slate-200">{item.text}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <style>{`
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #334155; border-radius: 10px; }
+      `}</style>
+    </div>
+  );
+};
+
+export default App;
